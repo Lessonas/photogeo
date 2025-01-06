@@ -1,45 +1,54 @@
-from flask import Flask, request, render_template, jsonify, current_app
-from flask_caching import Cache
+import os
+import logging
+from logging.handlers import RotatingFileHandler
+from flask import Flask, request, jsonify, render_template, send_from_directory
+from werkzeug.utils import secure_filename
+from concurrent.futures import ThreadPoolExecutor
+import reverse_geocoder as rg
+from google.cloud import vision
 from PIL import Image
 import exifread
+from dotenv import load_dotenv
+from flask_talisman import Talisman
+from flask_caching import Cache
 from geopy.geocoders import Nominatim, GoogleV3
 from geopy.exc import GeocoderTimedOut
-import os
-from datetime import datetime
-import folium
 import requests
 import re
 import io
 import json
 import tempfile
 import urllib.parse
-from google.cloud import vision
 import numpy as np
-from dotenv import load_dotenv
-import redis
-import logging
-from logging.handlers import RotatingFileHandler
-from concurrent.futures import ThreadPoolExecutor
-from functools import lru_cache
 import hashlib
-from werkzeug.utils import secure_filename
+import folium
 
 # Load environment variables
 load_dotenv()
 
 # Configure logging
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
-handler = RotatingFileHandler('app.log', maxBytes=10000, backupCount=3)
-handler.setFormatter(logging.Formatter(
-    '%(asctime)s %(levelname)s: %(message)s [in %(pathname)s:%(lineno)d]'
-))
+if not os.path.exists('logs'):
+    os.makedirs('logs')
+
+logger = logging.getLogger('LessFinder')
+logger.setLevel(logging.INFO)
+handler = RotatingFileHandler('logs/app.log', maxBytes=10000, backupCount=3)
+handler.setLevel(logging.INFO)
+formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+handler.setFormatter(formatter)
 logger.addHandler(handler)
 
+# Initialize Flask app
 app = Flask(__name__)
 app.config['MAX_CONTENT_LENGTH'] = 16 * 1024 * 1024  # 16MB max file size
-app.config['UPLOAD_FOLDER'] = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'uploads')
-app.secret_key = os.getenv('SECRET_KEY', 'dev-key-123')
+app.config['UPLOAD_FOLDER'] = 'uploads'
+
+# Security headers
+Talisman(app, content_security_policy=None)
+
+# Ensure upload directory exists
+if not os.path.exists(app.config['UPLOAD_FOLDER']):
+    os.makedirs(app.config['UPLOAD_FOLDER'])
 
 # Configure caching
 cache_config = {

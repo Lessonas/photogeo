@@ -14,3 +14,5 @@ python-dotenv==1.0.0
 branca==0.8.0
 MarkupSafe==3.0.2
 Werkzeug==3.0.1
+reverse-geocoder==1.5.1
+concurrent-log-handler==0.9.24
