@@ -11,3 +11,5 @@ google-cloud-vision==3.5.0
 redis==5.0.1
 Flask-Caching==2.1.0
 python-dotenv==1.0.0
+transformers==4.36.2
+torch==2.1.2
