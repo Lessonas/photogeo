@@ -2,7 +2,10 @@
 <html lang="en">
 <head>
     <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <meta name="apple-mobile-web-app-capable" content="yes">
+    <meta name="apple-mobile-web-app-status-bar-style" content="black">
+    <meta name="format-detection" content="telephone=no">
     <title>LessFinder - Advanced Photo Geolocation</title>
     <link href="https://fonts.googleapis.com/css2?family=Poppins:wght@300;400;500;600;700&display=swap" rel="stylesheet">
     <link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0/css/all.min.css" rel="stylesheet">
@@ -173,6 +176,64 @@
             display: none;
         }
 
+        .map-links {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+            gap: 1rem;
+            margin-top: 1.5rem;
+        }
+
+        .map-link {
+            padding: 0.8rem;
+            border-radius: 5px;
+            text-align: center;
+            text-decoration: none;
+            color: white;
+            font-weight: 500;
+            transition: all 0.3s ease;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            gap: 0.5rem;
+        }
+
+        .map-link.apple {
+            background: #000000;
+        }
+
+        .map-link.google {
+            background: #4285f4;
+        }
+
+        .map-link.osm {
+            background: #7ebc6f;
+        }
+
+        .map-link:hover {
+            transform: translateY(-2px);
+            opacity: 0.9;
+        }
+
+        /* Safari-specific styles */
+        @supports (-webkit-touch-callout: none) {
+            .upload-area {
+                cursor: pointer;
+                -webkit-touch-callout: none;
+                -webkit-user-select: none;
+            }
+
+            .file-input {
+                position: absolute;
+                opacity: 0;
+                pointer-events: none;
+            }
+
+            .submit-btn {
+                -webkit-appearance: none;
+                padding: 1.2rem 2rem;
+            }
+        }
+
         @media (max-width: 768px) {
             .container {
                 padding: 1rem;
@@ -219,6 +280,7 @@
             <div class="location-info">
                 <h3>Location Details</h3>
                 <div id="location-details"></div>
+                <div class="map-links" id="map-links"></div>
             </div>
         </div>
     </div>
@@ -231,6 +293,21 @@
         const loading = document.querySelector('.loading');
         const resultContainer = document.getElementById('result-container');
         const errorMessage = document.getElementById('error-message');
+
+        // Detect Safari and iOS
+        const isSafari = /^((?!chrome|android).)*safari/i.test(navigator.userAgent);
+        const isiOS = /iPad|iPhone|iPod/.test(navigator.userAgent);
+
+        if (isSafari || isiOS) {
+            fileInput.accept = 'image/jpeg,image/png,image/heic';
+        }
+
+        // Safari file type checking
+        // const isSafari = /^((?!chrome|android).)*safari/i.test(navigator.userAgent);
+        
+        // if (isSafari) {
+        //     fileInput.accept = 'image/jpeg,image/png,image/heic';
+        // }
 
         // Drag and drop functionality
         ['dragenter', 'dragover', 'dragleave', 'drop'].forEach(eventName => {
@@ -270,6 +347,24 @@
             fileInput.click();
         });
 
+        // Handle Safari-specific file upload
+        if (isSafari || isiOS) {
+            dropArea.addEventListener('click', (e) => {
+                e.preventDefault();
+                fileInput.click();
+            });
+
+            fileInput.addEventListener('change', () => {
+                if (fileInput.files.length > 0) {
+                    const file = fileInput.files[0];
+                    // Update UI to show selected file
+                    const fileName = document.createElement('p');
+                    fileName.textContent = `Selected: ${file.name}`;
+                    dropArea.querySelector('p').replaceWith(fileName);
+                }
+            });
+        }
+
         form.addEventListener('submit', async (e) => {
             e.preventDefault();
             const formData = new FormData(form);
@@ -297,8 +392,10 @@
                     throw new Error(data.error);
                 }
 
-                // Update location details
+                // Update location details and create map links
                 const locationDetails = document.getElementById('location-details');
+                const mapLinks = document.getElementById('map-links');
+                
                 locationDetails.innerHTML = `
                     <p><strong>Location:</strong> ${data.location || 'Unknown'}</p>
                     <p><strong>Coordinates:</strong> ${data.latitude}, ${data.longitude}</p>
@@ -306,13 +403,38 @@
                     ${data.detected_objects ? `<p><strong>Detected:</strong> ${data.detected_objects.join(', ')}</p>` : ''}
                 `;
 
-                // Initialize map
+                // Create map links
                 if (data.latitude && data.longitude) {
+                    const coords = `${data.latitude},${data.longitude}`;
+                    const locationName = encodeURIComponent(data.location || 'Location');
+                    
+                    mapLinks.innerHTML = `
+                        <a href="maps://maps.apple.com/?q=${locationName}&ll=${coords}" class="map-link apple">
+                            <i class="fab fa-apple"></i> Apple Maps
+                        </a>
+                        <a href="https://www.google.com/maps/search/?api=1&query=${coords}" class="map-link google">
+                            <i class="fab fa-google"></i> Google Maps
+                        </a>
+                        <a href="https://www.openstreetmap.org/?mlat=${data.latitude}&mlon=${data.longitude}" class="map-link osm">
+                            <i class="fas fa-map"></i> OpenStreetMap
+                        </a>
+                    `;
+
+                    // Initialize map with better tile provider
                     const map = L.map('map').setView([data.latitude, data.longitude], 13);
-                    L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
-                        attribution: '© OpenStreetMap contributors'
+                    L.tileLayer('https://{s}.basemaps.cartocdn.com/light_all/{z}/{x}/{y}{r}.png', {
+                        attribution: '© OpenStreetMap contributors, © CARTO',
+                        subdomains: 'abcd',
+                        maxZoom: 19
                     }).addTo(map);
                     L.marker([data.latitude, data.longitude]).addTo(map);
+
+                    // Force map refresh for Safari
+                    if (isSafari || isiOS) {
+                        setTimeout(() => {
+                            map.invalidateSize();
+                        }, 100);
+                    }
                 }
 
                 resultContainer.style.display = 'block';
