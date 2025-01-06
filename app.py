@@ -22,6 +22,7 @@ from logging.handlers import RotatingFileHandler
 from concurrent.futures import ThreadPoolExecutor
 from functools import lru_cache
 import hashlib
+from werkzeug.utils import secure_filename
 
 # Load environment variables
 load_dotenv()
@@ -347,46 +348,18 @@ def convert_to_degrees(values):
     s = float(values[2].num) / float(values[2].den)
     return d + (m / 60.0) + (s / 3600.0)
 
-@app.route('/')
-def index():
-    return render_template('index.html')
-
-@app.route('/upload', methods=['POST'])
-def upload_file():
+def process_image(image_path):
+    """Process image and get location data."""
     try:
-        start_time = datetime.now()
-        logger.info('Starting new upload request')
-        
-        file = None
-        image_url = request.form.get('image_url')
-        
-        if image_url:
-            logger.info(f'Processing URL: {image_url}')
-            file_path = download_image(image_url)
-            if not file_path:
-                return jsonify({'error': 'Failed to download image'}), 400
-        else:
-            if 'file' not in request.files:
-                return jsonify({'error': 'No file uploaded'}), 400
-            
-            file = request.files['file']
-            if file.filename == '':
-                return jsonify({'error': 'No file selected'}), 400
-            
-            logger.info(f'Processing uploaded file: {file.filename}')
-            file_path = os.path.join(app.config['UPLOAD_FOLDER'], 
-                                   f"{datetime.now().strftime('%Y%m%d_%H%M%S')}_{file.filename}")
-            file.save(file_path)
-
         # Try multiple methods to get location in parallel
         location_data = None
         futures = []
         
         with ThreadPoolExecutor() as executor:
             # Start all detection methods in parallel
-            futures.append(executor.submit(get_exif_data, file_path))
-            futures.append(executor.submit(detect_location_google_vision, file_path))
-            futures.append(executor.submit(detect_location_ai, file_path))
+            futures.append(executor.submit(get_exif_data, image_path))
+            futures.append(executor.submit(detect_location_google_vision, image_path))
+            futures.append(executor.submit(detect_location_ai, image_path))
             
             # Process results as they complete
             for future in futures:
@@ -403,10 +376,10 @@ def upload_file():
 
         if not location_data:
             logger.warning('No location data found in image')
-            return jsonify({
+            return {
                 'error': 'No location data found in image',
-                'processing_time': str(datetime.now() - start_time)
-            }), 200
+                'processing_time': str(datetime.now() - datetime.now())
+            }
         
         # Get detailed location information
         location_name = get_location_name(location_data['latitude'], location_data['longitude'])
@@ -415,10 +388,7 @@ def upload_file():
         # Get nearby points of interest
         nearby = rg.search((location_data['latitude'], location_data['longitude']))
         
-        processing_time = datetime.now() - start_time
-        logger.info(f'Request completed in {processing_time}')
-        
-        return jsonify({
+        return {
             'latitude': location_data['latitude'],
             'longitude': location_data['longitude'],
             'location': location_name,
@@ -426,20 +396,56 @@ def upload_file():
             'confidence': location_data.get('confidence', 0.0),
             'nearby': nearby[0] if nearby else None,
             'detected_objects': location_data.get('detected_objects', []),
-            'processing_time': str(processing_time),
+            'processing_time': str(datetime.now() - datetime.now()),
             'map': bool(map_path)
-        })
-        
+        }
     except Exception as e:
-        logger.error(f'Error processing request: {str(e)}')
+        logger.error(f'Error processing image: {str(e)}')
+        return {
+            'error': str(e)
+        }
+
+@app.route('/')
+def index():
+    return render_template('index.html')
+
+@app.route('/upload', methods=['POST'])
+def upload_file():
+    try:
+        # Check if a file was uploaded
+        if 'file' not in request.files:
+            return jsonify({'error': 'No file uploaded'}), 400
+        
+        file = request.files['file']
+        if file.filename == '':
+            return jsonify({'error': 'No file selected'}), 400
+
+        # Create uploads directory if it doesn't exist
+        if not os.path.exists('uploads'):
+            os.makedirs('uploads')
+
+        # Save the uploaded file
+        filename = secure_filename(file.filename)
+        filepath = os.path.join('uploads', filename)
+        file.save(filepath)
+
+        # Process the image and get location data
+        try:
+            location_data = process_image(filepath)
+            
+            # Clean up the uploaded file
+            os.remove(filepath)
+            
+            return jsonify(location_data)
+        except Exception as e:
+            # Clean up the uploaded file in case of error
+            if os.path.exists(filepath):
+                os.remove(filepath)
+            raise
+
+    except Exception as e:
+        logger.error(f'Error processing upload: {str(e)}')
         return jsonify({'error': str(e)}), 500
-    finally:
-        # Clean up temporary file
-        if image_url and file_path and os.path.exists(file_path):
-            try:
-                os.remove(file_path)
-            except Exception as e:
-                logger.error(f'Error cleaning up file: {str(e)}')
 
 if __name__ == '__main__':
     app.run(debug=True)
