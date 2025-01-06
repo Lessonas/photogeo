@@ -144,19 +144,30 @@ def get_location_name(lat, lon):
 
 def create_map(lat, lon):
     """Create maps with different views."""
-    # Create Folium map
-    m = folium.Map(location=[lat, lon], zoom_start=15)
-    folium.Marker([lat, lon]).add_to(m)
+    # Create Folium map with minimal features for faster loading
+    m = folium.Map(
+        location=[lat, lon],
+        zoom_start=15,
+        prefer_canvas=True,
+        disable_3d=True,
+        tiles='CartoDB positron'  # Using a lighter tile set
+    )
     
-    # Add Street View layer
+    # Add a simple marker
+    folium.Marker(
+        [lat, lon],
+        popup='Location',
+        icon=folium.Icon(color='red', icon='info-sign')
+    ).add_to(m)
+    
+    # Add custom HTML for different map views
     street_view_url = f"https://www.google.com/maps/@?api=1&map_action=pano&viewpoint={lat},{lon}"
     apple_maps_url = f"https://maps.apple.com/?ll={lat},{lon}&z=15"
     
-    # Add custom HTML for different map views
     html = f"""
-    <div class="map-links">
-        <a href="{street_view_url}" target="_blank" class="btn btn-primary">Open in Street View</a>
-        <a href="{apple_maps_url}" target="_blank" class="btn btn-primary">Open in Apple Maps</a>
+    <div class="map-links" style="text-align: center; padding: 10px;">
+        <a href="{street_view_url}" target="_blank" class="btn btn-primary" style="margin: 5px;">Street View</a>
+        <a href="{apple_maps_url}" target="_blank" class="btn btn-primary" style="margin: 5px;">Apple Maps</a>
     </div>
     """
     

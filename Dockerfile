@@ -1,8 +1,7 @@
 FROM python:3.10-slim
 
-# Install system dependencies
+# Install minimal system dependencies
 RUN apt-get update && apt-get install -y \
-    tesseract-ocr \
     libgl1-mesa-glx \
     libglib2.0-0 \
     && rm -rf /var/lib/apt/lists/*
@@ -23,4 +22,4 @@ RUN mkdir -p uploads static
 EXPOSE 8080
 
 # Command to run the application
-CMD ["gunicorn", "--bind", "0.0.0.0:8080", "app:app"]
+CMD ["gunicorn", "--bind", "0.0.0.0:8080", "--workers", "1", "--threads", "2", "--timeout", "120", "app:app"]
