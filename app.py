@@ -429,22 +429,59 @@ def upload_file():
         filepath = os.path.join('uploads', filename)
         file.save(filepath)
 
-        # Process the image and get location data
         try:
-            location_data = process_image(filepath)
+            # Get location data from image
+            with ThreadPoolExecutor() as executor:
+                # Start all detection methods in parallel
+                futures = []
+                futures.append(executor.submit(get_exif_data, filepath))
+                futures.append(executor.submit(detect_location_google_vision, filepath))
+                
+                # Process results as they complete
+                location_data = None
+                for future in futures:
+                    try:
+                        result = future.result()
+                        if result and result.get('confidence', 0) > (location_data.get('confidence', 0) if location_data else 0):
+                            location_data = result
+                    except Exception as e:
+                        logger.error(f'Error in detection method: {str(e)}')
+
+            if not location_data:
+                return jsonify({
+                    'error': 'No location data found in image'
+                }), 404
+
+            # Get detailed location information
+            location_name = get_location_name(location_data['latitude'], location_data['longitude'])
             
-            # Clean up the uploaded file
-            os.remove(filepath)
-            
-            return jsonify(location_data)
+            # Get nearby points of interest
+            nearby = rg.search((location_data['latitude'], location_data['longitude']))
+
+            response_data = {
+                'latitude': location_data['latitude'],
+                'longitude': location_data['longitude'],
+                'location': location_name,
+                'confidence': location_data.get('confidence', 0.0),
+                'nearby': nearby[0] if nearby else None,
+                'detected_objects': location_data.get('detected_objects', [])
+            }
+
+            return jsonify(response_data), 200
+
         except Exception as e:
-            # Clean up the uploaded file in case of error
-            if os.path.exists(filepath):
-                os.remove(filepath)
-            raise
+            logger.error(f'Error processing image: {str(e)}')
+            return jsonify({'error': str(e)}), 500
+        finally:
+            # Clean up the uploaded file
+            try:
+                if os.path.exists(filepath):
+                    os.remove(filepath)
+            except Exception as e:
+                logger.error(f'Error removing temporary file: {str(e)}')
 
     except Exception as e:
-        logger.error(f'Error processing upload: {str(e)}')
+        logger.error(f'Error handling upload: {str(e)}')
         return jsonify({'error': str(e)}), 500
 
 if __name__ == '__main__':

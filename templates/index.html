@@ -302,13 +302,6 @@
             fileInput.accept = 'image/jpeg,image/png,image/heic';
         }
 
-        // Safari file type checking
-        // const isSafari = /^((?!chrome|android).)*safari/i.test(navigator.userAgent);
-        
-        // if (isSafari) {
-        //     fileInput.accept = 'image/jpeg,image/png,image/heic';
-        // }
-
         // Drag and drop functionality
         ['dragenter', 'dragover', 'dragleave', 'drop'].forEach(eventName => {
             dropArea.addEventListener(eventName, preventDefaults, false);
@@ -367,7 +360,6 @@
 
         form.addEventListener('submit', async (e) => {
             e.preventDefault();
-            const formData = new FormData(form);
 
             // Check if a file was selected
             if (!fileInput.files.length) {
@@ -381,18 +373,22 @@
                 errorMessage.style.display = 'none';
                 resultContainer.style.display = 'none';
 
+                const formData = new FormData();
+                formData.append('file', fileInput.files[0]);
+
                 const response = await fetch('/upload', {
                     method: 'POST',
                     body: formData
                 });
 
-                const data = await response.json();
-
-                if (data.error) {
-                    throw new Error(data.error);
+                if (!response.ok) {
+                    const data = await response.json();
+                    throw new Error(data.error || 'Failed to process image');
                 }
 
-                // Update location details and create map links
+                const data = await response.json();
+
+                // Update location details
                 const locationDetails = document.getElementById('location-details');
                 const mapLinks = document.getElementById('map-links');
                 
@@ -403,7 +399,6 @@
                     ${data.detected_objects ? `<p><strong>Detected:</strong> ${data.detected_objects.join(', ')}</p>` : ''}
                 `;
 
-                // Create map links
                 if (data.latitude && data.longitude) {
                     const coords = `${data.latitude},${data.longitude}`;
                     const locationName = encodeURIComponent(data.location || 'Location');
@@ -420,13 +415,21 @@
                         </a>
                     `;
 
-                    // Initialize map with better tile provider
+                    // Initialize map
+                    const mapDiv = document.getElementById('map');
+                    if (mapDiv._leaflet) {
+                        mapDiv._leaflet.remove();
+                    }
+                    
                     const map = L.map('map').setView([data.latitude, data.longitude], 13);
+                    mapDiv._leaflet = map;
+                    
                     L.tileLayer('https://{s}.basemaps.cartocdn.com/light_all/{z}/{x}/{y}{r}.png', {
                         attribution: '© OpenStreetMap contributors, © CARTO',
                         subdomains: 'abcd',
                         maxZoom: 19
                     }).addTo(map);
+                    
                     L.marker([data.latitude, data.longitude]).addTo(map);
 
                     // Force map refresh for Safari
@@ -439,6 +442,7 @@
 
                 resultContainer.style.display = 'block';
             } catch (error) {
+                console.error('Error:', error);
                 errorMessage.textContent = error.message || 'An error occurred while processing your image.';
                 errorMessage.style.display = 'block';
             } finally {
