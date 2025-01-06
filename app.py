@@ -52,7 +52,21 @@ cache = Cache(app)
 
 # Initialize services with error handling
 try:
-    vision_client = vision.ImageAnnotatorClient()
+    # Initialize Google Cloud Vision client with credentials from environment
+    credentials_json = os.getenv('GOOGLE_CREDENTIALS_JSON')
+    if credentials_json:
+        import json
+        from google.oauth2 import service_account
+        
+        # Parse credentials JSON from environment variable
+        credentials_info = json.loads(credentials_json)
+        credentials = service_account.Credentials.from_service_account_info(credentials_info)
+        vision_client = vision.ImageAnnotatorClient(credentials=credentials)
+    else:
+        # Fallback to default credentials (for local development)
+        vision_client = vision.ImageAnnotatorClient()
+    
+    # Initialize Redis client
     redis_client = redis.from_url(os.getenv('REDIS_URL', 'redis://localhost:6379/0'))
     executor = ThreadPoolExecutor(max_workers=3)
     logger.info('Successfully initialized all services')
