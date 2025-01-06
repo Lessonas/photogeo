@@ -12,7 +12,8 @@ redis==5.0.1
 Flask-Caching==2.1.0
 python-dotenv==1.0.0
 branca==0.8.0
-MarkupSafe==3.0.2
+MarkupSafe==3.0.1
 Werkzeug==3.0.1
 reverse-geocoder==1.5.1
 concurrent-log-handler==0.9.24
+google-auth==2.25.2

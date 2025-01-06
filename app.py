@@ -39,53 +39,52 @@ handler.setFormatter(formatter)
 logger.addHandler(handler)
 
 # Initialize Flask app
-app = Flask(__name__)
+app = Flask(__name__, template_folder='templates', static_folder='static')
 app.config['MAX_CONTENT_LENGTH'] = 16 * 1024 * 1024  # 16MB max file size
 app.config['UPLOAD_FOLDER'] = 'uploads'
+app.config['SECRET_KEY'] = os.getenv('SECRET_KEY', 'dev-key-123')
+app.config['TEMPLATES_AUTO_RELOAD'] = True
 
 # Security headers
-Talisman(app, content_security_policy=None)
+talisman = Talisman(
+    app,
+    content_security_policy={
+        'default-src': "'self'",
+        'img-src': "'self' data: blob: *",
+        'script-src': "'self' 'unsafe-inline' 'unsafe-eval' https://unpkg.com https://cdnjs.cloudflare.com",
+        'style-src': "'self' 'unsafe-inline' https://fonts.googleapis.com https://cdnjs.cloudflare.com",
+        'font-src': "'self' https://fonts.gstatic.com https://cdnjs.cloudflare.com",
+        'connect-src': "'self' https://*.tiles.mapbox.com https://api.mapbox.com https://events.mapbox.com"
+    },
+    force_https=False  # Set to True in production
+)
+
+# Configure caching
+cache = Cache(app, config={
+    'CACHE_TYPE': 'redis',
+    'CACHE_REDIS_URL': os.getenv('REDIS_URL', 'redis://localhost:6379/0'),
+    'CACHE_DEFAULT_TIMEOUT': 300
+})
+
+# Initialize Google Cloud Vision client
+try:
+    if os.getenv('GOOGLE_CREDENTIALS_JSON'):
+        credentials_dict = json.loads(os.getenv('GOOGLE_CREDENTIALS_JSON'))
+        with tempfile.NamedTemporaryFile(mode='w', delete=False) as temp:
+            json.dump(credentials_dict, temp)
+            temp_credentials_path = temp.name
+        os.environ['GOOGLE_APPLICATION_CREDENTIALS'] = temp_credentials_path
+    vision_client = vision.ImageAnnotatorClient()
+except Exception as e:
+    logger.error(f"Error initializing Google Vision client: {str(e)}")
+    vision_client = None
 
 # Ensure upload directory exists
 if not os.path.exists(app.config['UPLOAD_FOLDER']):
     os.makedirs(app.config['UPLOAD_FOLDER'])
 
-# Configure caching
-cache_config = {
-    'CACHE_TYPE': 'redis',
-    'CACHE_REDIS_URL': os.getenv('REDIS_URL', 'redis://localhost:6379/0'),
-    'CACHE_DEFAULT_TIMEOUT': 3600,
-    'CACHE_KEY_PREFIX': 'photogeo_'
-}
-app.config.update(cache_config)
-cache = Cache(app)
-
 # Initialize services with error handling
 try:
-    # Initialize Google Cloud Vision client with credentials from environment
-    credentials_json = os.getenv('GOOGLE_CREDENTIALS_JSON')
-    if not credentials_json:
-        raise ValueError("GOOGLE_CREDENTIALS_JSON environment variable not set")
-        
-    # Create credentials from JSON string
-    import json
-    from google.oauth2 import service_account
-    import tempfile
-    
-    # Write credentials to a temporary file
-    with tempfile.NamedTemporaryFile(mode='w', suffix='.json', delete=False) as temp_file:
-        json.dump(json.loads(credentials_json), temp_file)
-        temp_credentials_path = temp_file.name
-    
-    # Set the environment variable to point to our temporary file
-    os.environ['GOOGLE_APPLICATION_CREDENTIALS'] = temp_credentials_path
-    
-    # Initialize vision client
-    vision_client = vision.ImageAnnotatorClient()
-    
-    # Clean up the temporary file
-    os.unlink(temp_credentials_path)
-    
     # Initialize Redis client
     redis_client = redis.from_url(os.getenv('REDIS_URL', 'redis://localhost:6379/0'))
     executor = ThreadPoolExecutor(max_workers=3)
@@ -448,11 +447,16 @@ def upload_file():
                 
                 # Process results as they complete
                 location_data = None
+                detected_objects = []
+                
                 for future in futures:
                     try:
                         result = future.result()
-                        if result and result.get('confidence', 0) > (location_data.get('confidence', 0) if location_data else 0):
-                            location_data = result
+                        if result:
+                            if 'latitude' in result and result.get('confidence', 0) > (location_data.get('confidence', 0) if location_data else 0):
+                                location_data = result
+                            if 'detected_objects' in result:
+                                detected_objects.extend(result['detected_objects'])
                     except Exception as e:
                         logger.error(f'Error in detection method: {str(e)}')
 
@@ -464,16 +468,12 @@ def upload_file():
             # Get detailed location information
             location_name = get_location_name(location_data['latitude'], location_data['longitude'])
             
-            # Get nearby points of interest
-            nearby = rg.search((location_data['latitude'], location_data['longitude']))
-
             response_data = {
                 'latitude': location_data['latitude'],
                 'longitude': location_data['longitude'],
-                'location': location_name,
+                'location': location_name or 'Unknown Location',
                 'confidence': location_data.get('confidence', 0.0),
-                'nearby': nearby[0] if nearby else None,
-                'detected_objects': location_data.get('detected_objects', [])
+                'detected_objects': list(set(detected_objects))  # Remove duplicates
             }
 
             return jsonify(response_data), 200
