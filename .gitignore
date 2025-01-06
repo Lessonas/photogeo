@@ -22,18 +22,23 @@ var/
 
 # Virtual Environment
 venv/
+.env/
+.venv/
 ENV/
 
-# Application specific
-uploads/
-static/map.html
-
-# IDE specific
+# IDE
 .idea/
 .vscode/
 *.swp
 *.swo
 
-# OS specific
+# Project specific
+uploads/
+static/
+*.log
+.env
+google_credentials.json
+
+# System
 .DS_Store
 Thumbs.db

@@ -2,7 +2,7 @@ services:
   - type: web
     name: photo-geolocator
     env: python
-    buildCommand: pip install -r requirements.txt
+    buildCommand: chmod +x build.sh && ./build.sh
     startCommand: gunicorn app:app
     envVars:
       - key: PYTHON_VERSION
@@ -11,5 +11,23 @@ services:
         value: true
       - key: SECRET_KEY
         generateValue: true
+      - key: GOOGLE_CLOUD_PROJECT
+        value: photogeo-447004
+      - key: GOOGLE_CREDENTIALS_JSON
+        sync: false
+      - key: REDIS_URL
+        fromService:
+          type: redis
+          name: photo-geolocator-cache
+          property: connectionString
+    disk:
+      name: uploads
+      mountPath: /uploads
+      sizeGB: 1
     healthCheckPath: /
     autoDeploy: true
+
+  - type: redis
+    name: photo-geolocator-cache
+    ipAllowList: []
+    plan: free

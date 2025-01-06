@@ -66,38 +66,29 @@ try:
     # Initialize Google Cloud Vision client
     vision_client = vision.ImageAnnotatorClient()
     
-    # Initialize Mapbox
-    geocoder = Geocoder(access_token=os.environ.get('MAPBOX_TOKEN'))
-    
     logger.info('Successfully initialized all AI models and services')
 except Exception as e:
     logger.error(f'Error initializing AI models: {str(e)}')
 
 @cache.memoize(timeout=3600)
 def get_location_name(lat, lon):
-    """Get location name from coordinates using multiple services."""
+    """Get location name from coordinates using free geocoding service."""
     try:
-        # Try Mapbox first
-        response = geocoder.reverse(lon=lon, lat=lat)
-        if response.ok:
-            feature = response.geojson()['features'][0]
-            return feature['place_name']
-    except Exception as e:
-        logger.warning(f'Mapbox geocoding failed: {str(e)}')
-    
-    try:
-        # Fallback to Nominatim
         geolocator = Nominatim(user_agent="photo_geolocator")
         location = geolocator.reverse(f"{lat}, {lon}", language='en')
-        return location.address if location else "Location not found"
+        if location:
+            return location.address
+        
+        # Fallback to basic coordinates if geocoding fails
+        return f"Latitude: {lat}, Longitude: {lon}"
     except Exception as e:
-        logger.warning(f'Nominatim geocoding failed: {str(e)}')
-        return "Location lookup failed"
+        logger.warning(f'Geocoding failed: {str(e)}')
+        return f"Latitude: {lat}, Longitude: {lon}"
 
 def create_map(lat, lon, zoom=15):
-    """Create an enhanced interactive map."""
+    """Create an enhanced interactive map using OpenStreetMap."""
     try:
-        # Create Folium map with satellite and street layers
+        # Create Folium map with multiple free tile layers
         m = folium.Map(
             location=[lat, lon],
             zoom_start=zoom,
@@ -105,10 +96,15 @@ def create_map(lat, lon, zoom=15):
             control_scale=True
         )
         
-        # Add tile layers
-        folium.TileLayer('openstreetmap').add_to(m)
+        # Add free tile layers
+        folium.TileLayer('openstreetmap', name='OpenStreetMap').add_to(m)
         folium.TileLayer(
-            tiles='https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}',
+            tiles='https://{s}.tile.opentopomap.org/{z}/{x}/{y}.png',
+            attr='Map data: OpenStreetMap contributors, SRTM | Map style: OpenTopoMap (CC-BY-SA)',
+            name='Topographic'
+        ).add_to(m)
+        folium.TileLayer(
+            'https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}',
             attr='Esri',
             name='Satellite'
         ).add_to(m)
@@ -129,22 +125,20 @@ def create_map(lat, lon, zoom=15):
             fill=True
         ).add_to(m)
         
-        # Add layer control
+        # Add layer control and fullscreen option
         folium.LayerControl().add_to(m)
-        
-        # Add fullscreen option
         folium.plugins.Fullscreen().add_to(m)
         
         # Add custom HTML for different map views
+        osm_url = f"https://www.openstreetmap.org/?mlat={lat}&mlon={lon}#map={zoom}/{lat}/{lon}"
+        google_maps_url = f"https://www.google.com/maps/@{lat},{lon},{zoom}z"
         street_view_url = f"https://www.google.com/maps/@?api=1&map_action=pano&viewpoint={lat},{lon}"
-        apple_maps_url = f"https://maps.apple.com/?ll={lat},{lon}&z=15"
-        bing_maps_url = f"https://www.bing.com/maps?cp={lat}~{lon}&lvl=15"
         
         html = f"""
         <div class="map-links" style="text-align: center; padding: 10px;">
+            <a href="{osm_url}" target="_blank" class="btn btn-primary" style="margin: 5px;">OpenStreetMap</a>
+            <a href="{google_maps_url}" target="_blank" class="btn btn-primary" style="margin: 5px;">Google Maps</a>
             <a href="{street_view_url}" target="_blank" class="btn btn-primary" style="margin: 5px;">Street View</a>
-            <a href="{apple_maps_url}" target="_blank" class="btn btn-primary" style="margin: 5px;">Apple Maps</a>
-            <a href="{bing_maps_url}" target="_blank" class="btn btn-primary" style="margin: 5px;">Bing Maps</a>
         </div>
         """
         
