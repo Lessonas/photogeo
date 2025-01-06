@@ -5,6 +5,8 @@ set -o errexit
 # Install Python dependencies
 pip install -r requirements.txt
 
-# Create uploads directory
+# Create necessary directories
 mkdir -p uploads
+mkdir -p logs
 chmod 777 uploads
+chmod 777 logs

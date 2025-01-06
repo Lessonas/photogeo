@@ -28,7 +28,7 @@ load_dotenv()
 
 # Configure logging
 if not os.path.exists('logs'):
-    os.makedirs('logs')
+    os.makedirs('logs', exist_ok=True)
 
 logger = logging.getLogger('LessFinder')
 logger.setLevel(logging.INFO)
@@ -37,6 +37,12 @@ handler.setLevel(logging.INFO)
 formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 handler.setFormatter(formatter)
 logger.addHandler(handler)
+
+# Also log to stdout for Render logs
+console_handler = logging.StreamHandler()
+console_handler.setLevel(logging.INFO)
+console_handler.setFormatter(formatter)
+logger.addHandler(console_handler)
 
 # Initialize Flask app
 app = Flask(__name__, template_folder='templates', static_folder='static')
