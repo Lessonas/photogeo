@@ -54,17 +54,27 @@ cache = Cache(app)
 try:
     # Initialize Google Cloud Vision client with credentials from environment
     credentials_json = os.getenv('GOOGLE_CREDENTIALS_JSON')
-    if credentials_json:
-        import json
-        from google.oauth2 import service_account
+    if not credentials_json:
+        raise ValueError("GOOGLE_CREDENTIALS_JSON environment variable not set")
         
-        # Parse credentials JSON from environment variable
-        credentials_info = json.loads(credentials_json)
-        credentials = service_account.Credentials.from_service_account_info(credentials_info)
-        vision_client = vision.ImageAnnotatorClient(credentials=credentials)
-    else:
-        # Fallback to default credentials (for local development)
-        vision_client = vision.ImageAnnotatorClient()
+    # Create credentials from JSON string
+    import json
+    from google.oauth2 import service_account
+    import tempfile
+    
+    # Write credentials to a temporary file
+    with tempfile.NamedTemporaryFile(mode='w', suffix='.json', delete=False) as temp_file:
+        json.dump(json.loads(credentials_json), temp_file)
+        temp_credentials_path = temp_file.name
+    
+    # Set the environment variable to point to our temporary file
+    os.environ['GOOGLE_APPLICATION_CREDENTIALS'] = temp_credentials_path
+    
+    # Initialize vision client
+    vision_client = vision.ImageAnnotatorClient()
+    
+    # Clean up the temporary file
+    os.unlink(temp_credentials_path)
     
     # Initialize Redis client
     redis_client = redis.from_url(os.getenv('REDIS_URL', 'redis://localhost:6379/0'))
