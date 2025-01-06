@@ -7,3 +7,7 @@ requests==2.31.0
 gunicorn==21.2.0
 numpy==1.24.3
 flask-talisman==1.1.0
+transformers==4.36.2
+torch==2.1.2
+google-cloud-vision==3.5.0
+reverse-geocoder==1.5.1

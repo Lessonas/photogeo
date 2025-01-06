@@ -11,20 +11,109 @@ import io
 import json
 import tempfile
 import urllib.parse
+from transformers import AutoImageProcessor, AutoModelForImageClassification
+import torch
+from google.cloud import vision
+import reverse_geocoder as rg
+import numpy as np
 
 app = Flask(__name__)
 app.config['MAX_CONTENT_LENGTH'] = 16 * 1024 * 1024  # 16MB max file size
 app.config['UPLOAD_FOLDER'] = 'uploads'
 app.config['SECRET_KEY'] = os.environ.get('SECRET_KEY', 'dev-key-change-this-in-production')
 
-# Configure for production
-if os.environ.get('PRODUCTION'):
-    from flask_talisman import Talisman
-    Talisman(app, content_security_policy=None)
+# Initialize AI models
+try:
+    # Load landmark detection model
+    processor = AutoImageProcessor.from_pretrained("google/vit-base-patch16-224")
+    model = AutoModelForImageClassification.from_pretrained("google/vit-base-patch16-224")
+    
+    # Initialize Google Cloud Vision client
+    vision_client = vision.ImageAnnotatorClient()
+except Exception as e:
+    print(f"Warning: AI models not loaded: {str(e)}")
 
-# Ensure upload folder exists
-os.makedirs(app.config['UPLOAD_FOLDER'], exist_ok=True)
-os.makedirs('static', exist_ok=True)
+def detect_location_google_vision(image_path):
+    """Detect location using Google Cloud Vision API."""
+    try:
+        with io.open(image_path, 'rb') as image_file:
+            content = image_file.read()
+
+        image = vision.Image(content=content)
+        
+        # Detect landmarks
+        response = vision_client.landmark_detection(image=image)
+        landmarks = response.landmark_annotations
+
+        if landmarks:
+            landmark = landmarks[0]
+            lat = landmark.locations[0].lat_lng.latitude
+            lon = landmark.locations[0].lat_lng.longitude
+            return {
+                'latitude': lat,
+                'longitude': lon,
+                'confidence': landmark.score,
+                'name': landmark.description,
+                'source': 'Google Vision API'
+            }
+
+        # Try object detection if no landmarks found
+        objects = vision_client.object_localization(image=image).localized_object_annotations
+        if objects:
+            # Use reverse geocoding for detected objects' context
+            context = [obj.name for obj in objects]
+            return {
+                'detected_objects': context,
+                'source': 'Object Detection'
+            }
+
+        return None
+    except Exception as e:
+        print(f"Google Vision API error: {str(e)}")
+        return None
+
+def detect_location_ai(image_path):
+    """Detect location using AI model."""
+    try:
+        image = Image.open(image_path)
+        inputs = processor(images=image, return_tensors="pt")
+        outputs = model(**inputs)
+        probabilities = torch.nn.functional.softmax(outputs.logits, dim=-1)
+        
+        # Get top predictions
+        top_prob, top_label = torch.topk(probabilities, k=5)
+        predictions = []
+        for prob, label in zip(top_prob[0], top_label[0]):
+            predictions.append({
+                'label': model.config.id2label[label.item()],
+                'confidence': prob.item()
+            })
+        
+        return predictions
+    except Exception as e:
+        print(f"AI model error: {str(e)}")
+        return None
+
+def analyze_image_context(predictions):
+    """Analyze image context from AI predictions to estimate location."""
+    try:
+        # Use a geocoding service to get location from predicted labels
+        geolocator = Nominatim(user_agent="photo_geolocator")
+        
+        for pred in predictions:
+            location = geolocator.geocode(pred['label'], exactly_one=True)
+            if location:
+                return {
+                    'latitude': location.latitude,
+                    'longitude': location.longitude,
+                    'confidence': pred['confidence'],
+                    'source': 'AI Context Analysis',
+                    'detected_label': pred['label']
+                }
+        return None
+    except Exception as e:
+        print(f"Context analysis error: {str(e)}")
+        return None
 
 def extract_location_from_text(text):
     """Extract potential location information from text using various patterns."""
@@ -160,12 +249,10 @@ def upload_file():
         image_url = request.form.get('image_url')
         
         if image_url:
-            # Handle URL input
             file_path = download_image(image_url)
             if not file_path:
                 return jsonify({'error': 'Failed to download image'}), 400
         else:
-            # Handle file upload
             if 'file' not in request.files:
                 return jsonify({'error': 'No file uploaded'}), 400
             
@@ -173,31 +260,61 @@ def upload_file():
             if file.filename == '':
                 return jsonify({'error': 'No file selected'}), 400
             
-            # Save the uploaded file
             file_path = os.path.join(app.config['UPLOAD_FOLDER'], 
                                    f"{datetime.now().strftime('%Y%m%d_%H%M%S')}_{file.filename}")
             file.save(file_path)
+
+        # Try multiple methods to get location
+        location_data = None
         
-        # Try EXIF data
+        # 1. Try EXIF data first
         exif_data = get_exif_data(file_path)
-        if not exif_data or not (exif_data['gps_latitude'] and exif_data['gps_longitude']):
+        if exif_data and exif_data['gps_latitude'] and exif_data['gps_longitude']:
+            location_data = {
+                'latitude': exif_data['gps_latitude'],
+                'longitude': exif_data['gps_longitude'],
+                'source': 'EXIF data',
+                'confidence': 1.0
+            }
+        
+        # 2. Try Google Cloud Vision API
+        if not location_data:
+            vision_data = detect_location_google_vision(file_path)
+            if vision_data and 'latitude' in vision_data:
+                location_data = vision_data
+        
+        # 3. Try AI-based detection
+        if not location_data:
+            ai_predictions = detect_location_ai(file_path)
+            if ai_predictions:
+                context_location = analyze_image_context(ai_predictions)
+                if context_location:
+                    location_data = context_location
+        
+        if not location_data:
             return jsonify({
                 'error': 'No location data found in image',
                 'device': exif_data['make'] + ' ' + exif_data['model'] if exif_data else 'Unknown',
                 'datetime': exif_data['datetime'] if exif_data else 'Unknown'
             }), 200
         
-        # Get location name and create map
-        location_name = get_location_name(exif_data['gps_latitude'], exif_data['gps_longitude'])
-        create_map(exif_data['gps_latitude'], exif_data['gps_longitude'])
+        # Get detailed location information
+        location_name = get_location_name(location_data['latitude'], location_data['longitude'])
+        create_map(location_data['latitude'], location_data['longitude'])
+        
+        # Get nearby points of interest
+        nearby = rg.search((location_data['latitude'], location_data['longitude']))
         
         return jsonify({
-            'latitude': exif_data['gps_latitude'],
-            'longitude': exif_data['gps_longitude'],
+            'latitude': location_data['latitude'],
+            'longitude': location_data['longitude'],
             'location': location_name,
-            'source': 'EXIF data',
+            'source': location_data['source'],
+            'confidence': location_data.get('confidence', 0.0),
             'device': exif_data['make'] + ' ' + exif_data['model'] if exif_data else 'Unknown',
             'datetime': exif_data['datetime'] if exif_data else 'Unknown',
+            'nearby': nearby[0] if nearby else None,
+            'detected_objects': location_data.get('detected_objects', []),
             'map': True
         })
         
