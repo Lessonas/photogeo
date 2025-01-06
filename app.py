@@ -1,4 +1,5 @@
 from flask import Flask, request, render_template, jsonify
+from flask_caching import Cache
 from PIL import Image
 import exifread
 from geopy.geocoders import Nominatim
@@ -16,11 +17,42 @@ import torch
 from google.cloud import vision
 import reverse_geocoder as rg
 import numpy as np
+import tensorflow as tf
+import tensorflow_hub as hub
+from dotenv import load_dotenv
+from mapbox import Geocoder
+import redis
+from sklearn.ensemble import RandomForestClassifier
+from concurrent.futures import ThreadPoolExecutor
+import logging
+from logging.handlers import RotatingFileHandler
+
+# Load environment variables
+load_dotenv()
+
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+handler = RotatingFileHandler('app.log', maxBytes=10000000, backupCount=5)
+handler.setFormatter(logging.Formatter(
+    '%(asctime)s %(levelname)s: %(message)s [in %(pathname)s:%(lineno)d]'
+))
+logger.addHandler(handler)
 
 app = Flask(__name__)
 app.config['MAX_CONTENT_LENGTH'] = 16 * 1024 * 1024  # 16MB max file size
 app.config['UPLOAD_FOLDER'] = 'uploads'
 app.config['SECRET_KEY'] = os.environ.get('SECRET_KEY', 'dev-key-change-this-in-production')
+
+# Configure caching
+cache = Cache(app, config={
+    'CACHE_TYPE': 'redis',
+    'CACHE_REDIS_URL': os.environ.get('REDIS_URL', 'redis://localhost:6379/0'),
+    'CACHE_DEFAULT_TIMEOUT': 300
+})
+
+# Initialize thread pool
+executor = ThreadPoolExecutor(max_workers=3)
 
 # Initialize AI models
 try:
@@ -28,10 +60,101 @@ try:
     processor = AutoImageProcessor.from_pretrained("google/vit-base-patch16-224")
     model = AutoModelForImageClassification.from_pretrained("google/vit-base-patch16-224")
     
+    # Load TensorFlow model for scene recognition
+    scene_model = hub.load('https://tfhub.dev/google/imagenet/mobilenet_v3_large_100_224/classification/5')
+    
     # Initialize Google Cloud Vision client
     vision_client = vision.ImageAnnotatorClient()
+    
+    # Initialize Mapbox
+    geocoder = Geocoder(access_token=os.environ.get('MAPBOX_TOKEN'))
+    
+    logger.info('Successfully initialized all AI models and services')
 except Exception as e:
-    print(f"Warning: AI models not loaded: {str(e)}")
+    logger.error(f'Error initializing AI models: {str(e)}')
+
+@cache.memoize(timeout=3600)
+def get_location_name(lat, lon):
+    """Get location name from coordinates using multiple services."""
+    try:
+        # Try Mapbox first
+        response = geocoder.reverse(lon=lon, lat=lat)
+        if response.ok:
+            feature = response.geojson()['features'][0]
+            return feature['place_name']
+    except Exception as e:
+        logger.warning(f'Mapbox geocoding failed: {str(e)}')
+    
+    try:
+        # Fallback to Nominatim
+        geolocator = Nominatim(user_agent="photo_geolocator")
+        location = geolocator.reverse(f"{lat}, {lon}", language='en')
+        return location.address if location else "Location not found"
+    except Exception as e:
+        logger.warning(f'Nominatim geocoding failed: {str(e)}')
+        return "Location lookup failed"
+
+def create_map(lat, lon, zoom=15):
+    """Create an enhanced interactive map."""
+    try:
+        # Create Folium map with satellite and street layers
+        m = folium.Map(
+            location=[lat, lon],
+            zoom_start=zoom,
+            prefer_canvas=True,
+            control_scale=True
+        )
+        
+        # Add tile layers
+        folium.TileLayer('openstreetmap').add_to(m)
+        folium.TileLayer(
+            tiles='https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}',
+            attr='Esri',
+            name='Satellite'
+        ).add_to(m)
+        
+        # Add marker with popup
+        folium.Marker(
+            [lat, lon],
+            popup='Location',
+            icon=folium.Icon(color='red', icon='info-sign')
+        ).add_to(m)
+        
+        # Add circle for accuracy radius
+        folium.Circle(
+            radius=100,
+            location=[lat, lon],
+            popup='Approximate Area',
+            color='red',
+            fill=True
+        ).add_to(m)
+        
+        # Add layer control
+        folium.LayerControl().add_to(m)
+        
+        # Add fullscreen option
+        folium.plugins.Fullscreen().add_to(m)
+        
+        # Add custom HTML for different map views
+        street_view_url = f"https://www.google.com/maps/@?api=1&map_action=pano&viewpoint={lat},{lon}"
+        apple_maps_url = f"https://maps.apple.com/?ll={lat},{lon}&z=15"
+        bing_maps_url = f"https://www.bing.com/maps?cp={lat}~{lon}&lvl=15"
+        
+        html = f"""
+        <div class="map-links" style="text-align: center; padding: 10px;">
+            <a href="{street_view_url}" target="_blank" class="btn btn-primary" style="margin: 5px;">Street View</a>
+            <a href="{apple_maps_url}" target="_blank" class="btn btn-primary" style="margin: 5px;">Apple Maps</a>
+            <a href="{bing_maps_url}" target="_blank" class="btn btn-primary" style="margin: 5px;">Bing Maps</a>
+        </div>
+        """
+        
+        m.get_root().html.add_child(folium.Element(html))
+        map_path = os.path.join('static', 'map.html')
+        m.save(map_path)
+        return map_path
+    except Exception as e:
+        logger.error(f'Error creating map: {str(e)}')
+        return None
 
 def detect_location_google_vision(image_path):
     """Detect location using Google Cloud Vision API."""
@@ -69,7 +192,7 @@ def detect_location_google_vision(image_path):
 
         return None
     except Exception as e:
-        print(f"Google Vision API error: {str(e)}")
+        logger.error(f'Google Vision API error: {str(e)}')
         return None
 
 def detect_location_ai(image_path):
@@ -91,7 +214,7 @@ def detect_location_ai(image_path):
         
         return predictions
     except Exception as e:
-        print(f"AI model error: {str(e)}")
+        logger.error(f'AI model error: {str(e)}')
         return None
 
 def analyze_image_context(predictions):
@@ -112,7 +235,7 @@ def analyze_image_context(predictions):
                 }
         return None
     except Exception as e:
-        print(f"Context analysis error: {str(e)}")
+        logger.error(f'Context analysis error: {str(e)}')
         return None
 
 def extract_location_from_text(text):
@@ -145,7 +268,7 @@ def download_image(url):
         
         return temp.name
     except Exception as e:
-        print(f"Error downloading image: {str(e)}")
+        logger.error(f'Error downloading image: {str(e)}')
         return None
 
 def get_exif_data(image_path):
@@ -185,7 +308,7 @@ def get_exif_data(image_path):
         
         return exif_data
     except Exception as e:
-        print(f"Error reading EXIF: {str(e)}")
+        logger.error(f'Error reading EXIF: {str(e)}')
         return None
 
 def convert_to_degrees(values):
@@ -195,49 +318,6 @@ def convert_to_degrees(values):
     s = float(values[2].num) / float(values[2].den)
     return d + (m / 60.0) + (s / 3600.0)
 
-def get_location_name(lat, lon):
-    """Get location name from coordinates using reverse geocoding."""
-    try:
-        geolocator = Nominatim(user_agent="photo_geolocator")
-        location = geolocator.reverse(f"{lat}, {lon}", language='en')
-        return location.address if location else "Location not found"
-    except:
-        return "Location lookup failed"
-
-def create_map(lat, lon):
-    """Create maps with different views."""
-    # Create Folium map with minimal features for faster loading
-    m = folium.Map(
-        location=[lat, lon],
-        zoom_start=15,
-        prefer_canvas=True,
-        disable_3d=True,
-        tiles='CartoDB positron'  # Using a lighter tile set
-    )
-    
-    # Add a simple marker
-    folium.Marker(
-        [lat, lon],
-        popup='Location',
-        icon=folium.Icon(color='red', icon='info-sign')
-    ).add_to(m)
-    
-    # Add custom HTML for different map views
-    street_view_url = f"https://www.google.com/maps/@?api=1&map_action=pano&viewpoint={lat},{lon}"
-    apple_maps_url = f"https://maps.apple.com/?ll={lat},{lon}&z=15"
-    
-    html = f"""
-    <div class="map-links" style="text-align: center; padding: 10px;">
-        <a href="{street_view_url}" target="_blank" class="btn btn-primary" style="margin: 5px;">Street View</a>
-        <a href="{apple_maps_url}" target="_blank" class="btn btn-primary" style="margin: 5px;">Apple Maps</a>
-    </div>
-    """
-    
-    m.get_root().html.add_child(folium.Element(html))
-    map_path = os.path.join('static', 'map.html')
-    m.save(map_path)
-    return map_path
-
 @app.route('/')
 def index():
     return render_template('index.html')
@@ -245,10 +325,14 @@ def index():
 @app.route('/upload', methods=['POST'])
 def upload_file():
     try:
+        start_time = datetime.now()
+        logger.info('Starting new upload request')
+        
         file = None
         image_url = request.form.get('image_url')
         
         if image_url:
+            logger.info(f'Processing URL: {image_url}')
             file_path = download_image(image_url)
             if not file_path:
                 return jsonify({'error': 'Failed to download image'}), 400
@@ -260,50 +344,50 @@ def upload_file():
             if file.filename == '':
                 return jsonify({'error': 'No file selected'}), 400
             
+            logger.info(f'Processing uploaded file: {file.filename}')
             file_path = os.path.join(app.config['UPLOAD_FOLDER'], 
                                    f"{datetime.now().strftime('%Y%m%d_%H%M%S')}_{file.filename}")
             file.save(file_path)
 
-        # Try multiple methods to get location
+        # Try multiple methods to get location in parallel
         location_data = None
+        futures = []
         
-        # 1. Try EXIF data first
-        exif_data = get_exif_data(file_path)
-        if exif_data and exif_data['gps_latitude'] and exif_data['gps_longitude']:
-            location_data = {
-                'latitude': exif_data['gps_latitude'],
-                'longitude': exif_data['gps_longitude'],
-                'source': 'EXIF data',
-                'confidence': 1.0
-            }
-        
-        # 2. Try Google Cloud Vision API
+        with ThreadPoolExecutor() as executor:
+            # Start all detection methods in parallel
+            futures.append(executor.submit(get_exif_data, file_path))
+            futures.append(executor.submit(detect_location_google_vision, file_path))
+            futures.append(executor.submit(detect_location_ai, file_path))
+            
+            # Process results as they complete
+            for future in futures:
+                result = future.result()
+                if result:
+                    if isinstance(result, dict) and 'latitude' in result:
+                        location_data = result
+                        break
+                    elif isinstance(result, list):  # AI predictions
+                        context_location = analyze_image_context(result)
+                        if context_location:
+                            location_data = context_location
+                            break
+
         if not location_data:
-            vision_data = detect_location_google_vision(file_path)
-            if vision_data and 'latitude' in vision_data:
-                location_data = vision_data
-        
-        # 3. Try AI-based detection
-        if not location_data:
-            ai_predictions = detect_location_ai(file_path)
-            if ai_predictions:
-                context_location = analyze_image_context(ai_predictions)
-                if context_location:
-                    location_data = context_location
-        
-        if not location_data:
+            logger.warning('No location data found in image')
             return jsonify({
                 'error': 'No location data found in image',
-                'device': exif_data['make'] + ' ' + exif_data['model'] if exif_data else 'Unknown',
-                'datetime': exif_data['datetime'] if exif_data else 'Unknown'
+                'processing_time': str(datetime.now() - start_time)
             }), 200
         
         # Get detailed location information
         location_name = get_location_name(location_data['latitude'], location_data['longitude'])
-        create_map(location_data['latitude'], location_data['longitude'])
+        map_path = create_map(location_data['latitude'], location_data['longitude'])
         
         # Get nearby points of interest
         nearby = rg.search((location_data['latitude'], location_data['longitude']))
+        
+        processing_time = datetime.now() - start_time
+        logger.info(f'Request completed in {processing_time}')
         
         return jsonify({
             'latitude': location_data['latitude'],
@@ -311,19 +395,22 @@ def upload_file():
             'location': location_name,
             'source': location_data['source'],
             'confidence': location_data.get('confidence', 0.0),
-            'device': exif_data['make'] + ' ' + exif_data['model'] if exif_data else 'Unknown',
-            'datetime': exif_data['datetime'] if exif_data else 'Unknown',
             'nearby': nearby[0] if nearby else None,
             'detected_objects': location_data.get('detected_objects', []),
-            'map': True
+            'processing_time': str(processing_time),
+            'map': bool(map_path)
         })
         
     except Exception as e:
+        logger.error(f'Error processing request: {str(e)}')
         return jsonify({'error': str(e)}), 500
     finally:
         # Clean up temporary file
         if image_url and file_path and os.path.exists(file_path):
-            os.remove(file_path)
+            try:
+                os.remove(file_path)
+            except Exception as e:
+                logger.error(f'Error cleaning up file: {str(e)}')
 
 if __name__ == '__main__':
     app.run(debug=True)
