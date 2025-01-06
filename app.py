@@ -1,8 +1,9 @@
-from flask import Flask, request, render_template, jsonify
+from flask import Flask, request, render_template, jsonify, current_app
 from flask_caching import Cache
 from PIL import Image
 import exifread
-from geopy.geocoders import Nominatim
+from geopy.geocoders import Nominatim, GoogleV3
+from geopy.exc import GeocoderTimedOut
 import os
 from datetime import datetime
 import folium
@@ -12,20 +13,15 @@ import io
 import json
 import tempfile
 import urllib.parse
-from transformers import AutoImageProcessor, AutoModelForImageClassification
-import torch
 from google.cloud import vision
-import reverse_geocoder as rg
 import numpy as np
-import tensorflow as tf
-import tensorflow_hub as hub
 from dotenv import load_dotenv
-from mapbox import Geocoder
 import redis
-from sklearn.ensemble import RandomForestClassifier
-from concurrent.futures import ThreadPoolExecutor
 import logging
 from logging.handlers import RotatingFileHandler
+from concurrent.futures import ThreadPoolExecutor
+from functools import lru_cache
+import hashlib
 
 # Load environment variables
 load_dotenv()
@@ -33,7 +29,7 @@ load_dotenv()
 # Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
-handler = RotatingFileHandler('app.log', maxBytes=10000000, backupCount=5)
+handler = RotatingFileHandler('app.log', maxBytes=10000, backupCount=3)
 handler.setFormatter(logging.Formatter(
     '%(asctime)s %(levelname)s: %(message)s [in %(pathname)s:%(lineno)d]'
 ))
@@ -41,192 +37,207 @@ logger.addHandler(handler)
 
 app = Flask(__name__)
 app.config['MAX_CONTENT_LENGTH'] = 16 * 1024 * 1024  # 16MB max file size
-app.config['UPLOAD_FOLDER'] = 'uploads'
-app.config['SECRET_KEY'] = os.environ.get('SECRET_KEY', 'dev-key-change-this-in-production')
+app.config['UPLOAD_FOLDER'] = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'uploads')
+app.secret_key = os.getenv('SECRET_KEY', 'dev-key-123')
 
 # Configure caching
-cache = Cache(app, config={
+cache_config = {
     'CACHE_TYPE': 'redis',
-    'CACHE_REDIS_URL': os.environ.get('REDIS_URL', 'redis://localhost:6379/0'),
-    'CACHE_DEFAULT_TIMEOUT': 300
-})
+    'CACHE_REDIS_URL': os.getenv('REDIS_URL', 'redis://localhost:6379/0'),
+    'CACHE_DEFAULT_TIMEOUT': 3600,
+    'CACHE_KEY_PREFIX': 'photogeo_'
+}
+app.config.update(cache_config)
+cache = Cache(app)
 
-# Initialize thread pool
-executor = ThreadPoolExecutor(max_workers=3)
-
-# Initialize AI models
+# Initialize services with error handling
 try:
-    # Load landmark detection model
-    processor = AutoImageProcessor.from_pretrained("google/vit-base-patch16-224")
-    model = AutoModelForImageClassification.from_pretrained("google/vit-base-patch16-224")
-    
-    # Load TensorFlow model for scene recognition
-    scene_model = hub.load('https://tfhub.dev/google/imagenet/mobilenet_v3_large_100_224/classification/5')
-    
-    # Initialize Google Cloud Vision client
     vision_client = vision.ImageAnnotatorClient()
-    
-    logger.info('Successfully initialized all AI models and services')
+    redis_client = redis.from_url(os.getenv('REDIS_URL', 'redis://localhost:6379/0'))
+    executor = ThreadPoolExecutor(max_workers=3)
+    logger.info('Successfully initialized all services')
 except Exception as e:
-    logger.error(f'Error initializing AI models: {str(e)}')
+    logger.error(f'Error initializing services: {str(e)}')
+    raise
 
-@cache.memoize(timeout=3600)
+def get_location_with_retry(geolocator, query, max_retries=3):
+    """Retry geocoding with exponential backoff."""
+    for attempt in range(max_retries):
+        try:
+            return geolocator.geocode(query, exactly_one=True)
+        except GeocoderTimedOut:
+            if attempt == max_retries - 1:
+                raise
+            time.sleep(2 ** attempt)
+
+@cache.memoize(timeout=86400)  # Cache for 24 hours
 def get_location_name(lat, lon):
-    """Get location name from coordinates using free geocoding service."""
+    """Enhanced reverse geocoding with multiple providers and caching."""
     try:
+        # Try Nominatim first
         geolocator = Nominatim(user_agent="photo_geolocator")
-        location = geolocator.reverse(f"{lat}, {lon}", language='en')
-        if location:
-            return location.address
+        location = get_location_with_retry(geolocator, f"{lat}, {lon}")
         
-        # Fallback to basic coordinates if geocoding fails
-        return f"Latitude: {lat}, Longitude: {lon}"
+        if location and location.address:
+            return location.address
+            
+        # Fallback to alternative geocoding if needed
+        return f"Location at {lat:.6f}, {lon:.6f}"
     except Exception as e:
-        logger.warning(f'Geocoding failed: {str(e)}')
-        return f"Latitude: {lat}, Longitude: {lon}"
+        logger.error(f'Geocoding error: {str(e)}')
+        return f"Location at {lat:.6f}, {lon:.6f}"
 
 def create_map(lat, lon, zoom=15):
-    """Create an enhanced interactive map using OpenStreetMap."""
+    """Create an enhanced interactive map with multiple layers."""
     try:
-        # Create Folium map with multiple free tile layers
-        m = folium.Map(
-            location=[lat, lon],
-            zoom_start=zoom,
-            prefer_canvas=True,
-            control_scale=True
-        )
+        m = folium.Map(location=[lat, lon], zoom_start=zoom)
         
-        # Add free tile layers
-        folium.TileLayer('openstreetmap', name='OpenStreetMap').add_to(m)
+        # Add multiple tile layers
+        folium.TileLayer('openstreetmap').add_to(m)
         folium.TileLayer(
-            tiles='https://{s}.tile.opentopomap.org/{z}/{x}/{y}.png',
-            attr='Map data: OpenStreetMap contributors, SRTM | Map style: OpenTopoMap (CC-BY-SA)',
-            name='Topographic'
-        ).add_to(m)
-        folium.TileLayer(
-            'https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}',
+            tiles='https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}',
             attr='Esri',
             name='Satellite'
         ).add_to(m)
         
         # Add marker with popup
+        location_name = get_location_name(lat, lon)
+        popup_html = f"""
+        <div style="width:200px">
+            <h4>{location_name}</h4>
+            <p>Coordinates: {lat:.6f}, {lon:.6f}</p>
+            <p>
+                <a href="https://www.google.com/maps?q={lat},{lon}" target="_blank">Open in Google Maps</a><br>
+                <a href="https://www.openstreetmap.org/?mlat={lat}&mlon={lon}" target="_blank">Open in OpenStreetMap</a>
+            </p>
+        </div>
+        """
         folium.Marker(
             [lat, lon],
-            popup='Location',
+            popup=folium.Popup(popup_html, max_width=300),
             icon=folium.Icon(color='red', icon='info-sign')
         ).add_to(m)
         
-        # Add circle for accuracy radius
+        # Add circle for accuracy visualization
         folium.Circle(
             radius=100,
             location=[lat, lon],
-            popup='Approximate Area',
-            color='red',
-            fill=True
+            color="red",
+            fill=True,
         ).add_to(m)
         
-        # Add layer control and fullscreen option
+        # Add layer control
         folium.LayerControl().add_to(m)
-        folium.plugins.Fullscreen().add_to(m)
         
-        # Add custom HTML for different map views
-        osm_url = f"https://www.openstreetmap.org/?mlat={lat}&mlon={lon}#map={zoom}/{lat}/{lon}"
-        google_maps_url = f"https://www.google.com/maps/@{lat},{lon},{zoom}z"
-        street_view_url = f"https://www.google.com/maps/@?api=1&map_action=pano&viewpoint={lat},{lon}"
-        
-        html = f"""
-        <div class="map-links" style="text-align: center; padding: 10px;">
-            <a href="{osm_url}" target="_blank" class="btn btn-primary" style="margin: 5px;">OpenStreetMap</a>
-            <a href="{google_maps_url}" target="_blank" class="btn btn-primary" style="margin: 5px;">Google Maps</a>
-            <a href="{street_view_url}" target="_blank" class="btn btn-primary" style="margin: 5px;">Street View</a>
-        </div>
-        """
-        
-        m.get_root().html.add_child(folium.Element(html))
-        map_path = os.path.join('static', 'map.html')
-        m.save(map_path)
-        return map_path
+        return m
     except Exception as e:
-        logger.error(f'Error creating map: {str(e)}')
-        return None
+        logger.error(f'Map creation error: {str(e)}')
+        raise
 
+@cache.memoize(timeout=3600)
 def detect_location_google_vision(image_path):
-    """Detect location using Google Cloud Vision API."""
+    """Enhanced location detection using Google Cloud Vision API."""
     try:
         with io.open(image_path, 'rb') as image_file:
             content = image_file.read()
 
         image = vision.Image(content=content)
         
-        # Detect landmarks
-        response = vision_client.landmark_detection(image=image)
-        landmarks = response.landmark_annotations
-
-        if landmarks:
-            landmark = landmarks[0]
-            lat = landmark.locations[0].lat_lng.latitude
-            lon = landmark.locations[0].lat_lng.longitude
-            return {
-                'latitude': lat,
-                'longitude': lon,
-                'confidence': landmark.score,
-                'name': landmark.description,
-                'source': 'Google Vision API'
-            }
-
-        # Try object detection if no landmarks found
-        objects = vision_client.object_localization(image=image).localized_object_annotations
-        if objects:
-            # Use reverse geocoding for detected objects' context
-            context = [obj.name for obj in objects]
-            return {
-                'detected_objects': context,
-                'source': 'Object Detection'
-            }
-
-        return None
+        # Run multiple detection types in parallel
+        landmark_future = executor.submit(vision_client.landmark_detection, image)
+        label_future = executor.submit(vision_client.label_detection, image)
+        text_future = executor.submit(vision_client.text_detection, image)
+        
+        # Gather results
+        landmark_response = landmark_future.result()
+        label_response = label_future.result()
+        text_response = text_future.result()
+        
+        results = {
+            'locations': [],
+            'labels': [],
+            'text': []
+        }
+        
+        # Process landmark detection
+        if landmark_response.landmark_annotations:
+            for landmark in landmark_response.landmark_annotations:
+                if landmark.locations:
+                    lat_lng = landmark.locations[0].lat_lng
+                    results['locations'].append({
+                        'name': landmark.description,
+                        'lat': lat_lng.latitude,
+                        'lng': lat_lng.longitude,
+                        'confidence': landmark.score,
+                        'source': 'landmark'
+                    })
+        
+        # Process labels for context
+        if label_response.label_annotations:
+            results['labels'] = [{
+                'description': label.description,
+                'confidence': label.score
+            } for label in label_response.label_annotations]
+        
+        # Process text for location hints
+        if text_response.text_annotations:
+            results['text'] = text_response.text_annotations[0].description if text_response.text_annotations else ''
+            
+        return results
     except Exception as e:
         logger.error(f'Google Vision API error: {str(e)}')
         return None
 
-def detect_location_ai(image_path):
-    """Detect location using AI model."""
-    try:
-        image = Image.open(image_path)
-        inputs = processor(images=image, return_tensors="pt")
-        outputs = model(**inputs)
-        probabilities = torch.nn.functional.softmax(outputs.logits, dim=-1)
-        
-        # Get top predictions
-        top_prob, top_label = torch.topk(probabilities, k=5)
-        predictions = []
-        for prob, label in zip(top_prob[0], top_label[0]):
-            predictions.append({
-                'label': model.config.id2label[label.item()],
-                'confidence': prob.item()
-            })
-        
-        return predictions
-    except Exception as e:
-        logger.error(f'AI model error: {str(e)}')
-        return None
-
 def analyze_image_context(predictions):
-    """Analyze image context from AI predictions to estimate location."""
+    """Enhanced context analysis with multiple data points."""
     try:
-        # Use a geocoding service to get location from predicted labels
-        geolocator = Nominatim(user_agent="photo_geolocator")
+        if not predictions:
+            return None
+            
+        # Check landmark detection results
+        if 'locations' in predictions and predictions['locations']:
+            # Sort by confidence and return the best match
+            locations = sorted(predictions['locations'], key=lambda x: x.get('confidence', 0), reverse=True)
+            best_location = locations[0]
+            return {
+                'latitude': best_location['lat'],
+                'longitude': best_location['lng'],
+                'confidence': best_location['confidence'],
+                'name': best_location.get('name', 'Unknown Location'),
+                'source': best_location.get('source', 'vision_api')
+            }
+            
+        # If no direct location found, try to infer from labels and text
+        location_hints = []
         
-        for pred in predictions:
-            location = geolocator.geocode(pred['label'], exactly_one=True)
-            if location:
-                return {
-                    'latitude': location.latitude,
-                    'longitude': location.longitude,
-                    'confidence': pred['confidence'],
-                    'source': 'AI Context Analysis',
-                    'detected_label': pred['label']
-                }
+        # Check labels for location hints
+        if 'labels' in predictions:
+            location_hints.extend([label['description'] for label in predictions['labels']])
+            
+        # Check text for location information
+        if 'text' in predictions and predictions['text']:
+            extracted_locations = extract_location_from_text(predictions['text'])
+            if extracted_locations:
+                location_hints.extend(extracted_locations)
+        
+        # Try to geocode location hints
+        if location_hints:
+            geolocator = Nominatim(user_agent="photo_geolocator")
+            for hint in location_hints:
+                try:
+                    location = get_location_with_retry(geolocator, hint)
+                    if location:
+                        return {
+                            'latitude': location.latitude,
+                            'longitude': location.longitude,
+                            'confidence': 0.5,  # Lower confidence for inferred locations
+                            'name': location.address,
+                            'source': 'inference'
+                        }
+                except Exception as e:
+                    logger.warning(f'Geocoding error for hint {hint}: {str(e)}')
+                    continue
+                    
         return None
     except Exception as e:
         logger.error(f'Context analysis error: {str(e)}')
