@@ -5,11 +5,7 @@ from geopy.geocoders import Nominatim
 import os
 from datetime import datetime
 import folium
-import cv2
-import numpy as np
-import pytesseract
 import requests
-from bs4 import BeautifulSoup
 import re
 import io
 import json
@@ -46,29 +42,6 @@ def extract_location_from_text(text):
             return matches[0]
     
     return None
-
-def extract_location_from_screenshot(image_path):
-    """Extract location data from screenshots using OCR."""
-    try:
-        # Read image using OpenCV
-        img = cv2.imread(image_path)
-        # Convert to grayscale
-        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-        # Apply threshold to get black and white image
-        _, binary = cv2.threshold(gray, 150, 255, cv2.THRESH_BINARY)
-        
-        # Perform OCR
-        text = pytesseract.image_to_string(binary)
-        
-        # Try to find coordinates in the text
-        coords = extract_location_from_text(text)
-        if coords:
-            return float(coords[0]), float(coords[1])
-        
-        return None
-    except Exception as e:
-        print(f"Error in OCR: {str(e)}")
-        return None
 
 def download_image(url):
     """Download image from URL and save to temporary file."""
@@ -205,33 +178,9 @@ def upload_file():
                                    f"{datetime.now().strftime('%Y%m%d_%H%M%S')}_{file.filename}")
             file.save(file_path)
         
-        # Try different methods to extract location
-        location_data = None
-        
-        # 1. Try EXIF data first
+        # Try EXIF data
         exif_data = get_exif_data(file_path)
-        if exif_data and exif_data['gps_latitude'] and exif_data['gps_longitude']:
-            location_data = {
-                'latitude': exif_data['gps_latitude'],
-                'longitude': exif_data['gps_longitude'],
-                'source': 'EXIF data'
-            }
-        
-        # 2. If no EXIF data, try OCR
-        if not location_data:
-            coords = extract_location_from_screenshot(file_path)
-            if coords:
-                location_data = {
-                    'latitude': coords[0],
-                    'longitude': coords[1],
-                    'source': 'OCR detection'
-                }
-        
-        # Clean up temporary file
-        if image_url and os.path.exists(file_path):
-            os.remove(file_path)
-        
-        if not location_data:
+        if not exif_data or not (exif_data['gps_latitude'] and exif_data['gps_longitude']):
             return jsonify({
                 'error': 'No location data found in image',
                 'device': exif_data['make'] + ' ' + exif_data['model'] if exif_data else 'Unknown',
@@ -239,14 +188,14 @@ def upload_file():
             }), 200
         
         # Get location name and create map
-        location_name = get_location_name(location_data['latitude'], location_data['longitude'])
-        create_map(location_data['latitude'], location_data['longitude'])
+        location_name = get_location_name(exif_data['gps_latitude'], exif_data['gps_longitude'])
+        create_map(exif_data['gps_latitude'], exif_data['gps_longitude'])
         
         return jsonify({
-            'latitude': location_data['latitude'],
-            'longitude': location_data['longitude'],
+            'latitude': exif_data['gps_latitude'],
+            'longitude': exif_data['gps_longitude'],
             'location': location_name,
-            'source': location_data['source'],
+            'source': 'EXIF data',
             'device': exif_data['make'] + ' ' + exif_data['model'] if exif_data else 'Unknown',
             'datetime': exif_data['datetime'] if exif_data else 'Unknown',
             'map': True
@@ -254,6 +203,10 @@ def upload_file():
         
     except Exception as e:
         return jsonify({'error': str(e)}), 500
+    finally:
+        # Clean up temporary file
+        if image_url and file_path and os.path.exists(file_path):
+            os.remove(file_path)
 
 if __name__ == '__main__':
     app.run(debug=True)
